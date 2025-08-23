@@ -1637,20 +1637,18 @@ fn find_vmlinuz_initrd_duplicates(digest: &str) -> Result<Option<String>> {
     Ok(symlink_to)
 }
 
-#[context("Writing BLS entries to disk")]
-fn write_bls_boot_entries_to_disk(
-    boot_dir: &Utf8PathBuf,
+/// Write vmlinuz and initrd to the rootfs boot directory
+#[context("Writing vmlinuz/initrd to rootfs")]
+fn write_vmlinuz_initrd_to_rootfs(
+    rootfs_boot_dir: &Utf8PathBuf,
     deployment_id: &Sha256HashValue,
     entry: &UsrLibModulesVmlinuz<Sha256HashValue>,
     repo: &ComposefsRepository<Sha256HashValue>,
 ) -> Result<()> {
     let id_hex = deployment_id.to_hex();
-
-    // Write the initrd and vmlinuz at /boot/<id>/
-    let path = boot_dir.join(&id_hex);
+    let path = rootfs_boot_dir.join(&id_hex);
     create_dir_all(&path)?;
-
-    let entries_dir = cap_std::fs::Dir::open_ambient_dir(&path, cap_std::ambient_authority())
+    let dir = cap_std::fs::Dir::open_ambient_dir(&path, cap_std::ambient_authority())
         .with_context(|| format!("Opening {path}"))?;
 
     println!("Writing vmlinuz to {:?}", entries_dir);
@@ -1661,6 +1659,10 @@ fn write_bls_boot_entries_to_disk(
         )
         .context("Writing vmlinuz to path")?;
 
+    dir.atomic_write(
+        "vmlinuz",
+        read_file(&entry.vmlinuz, &repo).context("Reading vmlinuz")?,
+    ).context("Writing vmlinuz to rootfs")?;
     let Some(initramfs) = &entry.initramfs else {
         anyhow::bail!("initramfs not found");
     };
@@ -1680,6 +1682,29 @@ fn write_bls_boot_entries_to_disk(
 
     rustix::fs::fsync(owned_fd).context("fsync")?;
 
+    dir.atomic_write(
+        "initrd",
+        read_file(initramfs, &repo).context("Reading initrd")?,
+    ).context("Writing initrd to rootfs")?;
+    let owned_fd = dir.reopen_as_ownedfd().context("Reopen as owned fd")?;
+    rustix::fs::fsync(owned_fd).context("fsync rootfs boot dir")?;
+    Ok(())
+}
+
+/// Write BLS entry to ESP, referencing vmlinuz/initrd in rootfs
+#[context("Writing BLS entry to ESP")]
+fn write_bls_entry_to_esp(
+    esp_dir: &Utf8PathBuf,
+    bls_config: &BLSConfig,
+) -> Result<()> {
+    let entries_dir = cap_std::fs::Dir::open_ambient_dir(esp_dir, cap_std::ambient_authority())
+        .with_context(|| format!("Opening {esp_dir}"))?;
+    entries_dir.atomic_write(
+        format!("bootc-composefs-{}.conf", bls_config.sort_key.as_ref().unwrap()),
+        bls_config.to_string().as_bytes(),
+    )?;
+    let owned_fd = entries_dir.reopen_as_ownedfd().context("Reopen as owned fd")?;
+    rustix::fs::fsync(owned_fd).context("fsync ESP dir")?;
     Ok(())
 }
 
@@ -1699,6 +1724,7 @@ pub(crate) fn setup_composefs_bls_boot(
 
     // Determine ESP path for writing boot files
     let (esp_path, cmdline_refs) = match setup_type {
+    let (root_path, esp_device, cmdline_refs) = match setup_type {
         BootSetupType::Setup((root_setup, state)) => {
             // Find ESP partition mount point
             let esp_mount = root_setup.physical_root_path.join("esp");
@@ -1722,12 +1748,59 @@ pub(crate) fn setup_composefs_bls_boot(
             ]
             .join(" "),
         ),
+
+            // Locate ESP partition device
+            let esp_part = root_setup
+                .device_info
+                .partitions
+                .iter()
+                .find(|p| p.parttype.as_str() == ESP_GUID)
+                .ok_or_else(|| anyhow::anyhow!("ESP partition not found"))?;
+
+            (
+                root_setup.physical_root_path.clone(),
+                esp_part.node.clone(),
+                cmdline_options,
+            )
+        }
+
+        BootSetupType::Upgrade => {
+            let sysroot = Utf8PathBuf::from("/sysroot");
+
+            let fsinfo = inspect_filesystem(&sysroot)?;
+            let parent_devices = find_parent_devices(&fsinfo.source)?;
+
+            let Some(parent) = parent_devices.into_iter().next() else {
+                anyhow::bail!("Could not find parent device for mountpoint /sysroot");
+            };
+
+            (
+                sysroot,
+                get_esp_partition(&parent)?.0,
+                vec![
+                    format!("root=UUID={DPS_UUID}"),
+                    RW_KARG.to_string(),
+                    format!("{COMPOSEFS_CMDLINE}={id_hex}"),
+                ]
+                .join(" "),
+            )
+        }
     };
 
     let boot_dir = esp_path.join("EFI/Linux");
+    let mounted_esp: PathBuf = root_path.join("esp").into();
+    let esp_mount_point_existed = mounted_esp.exists();
+
+    create_dir_all(&mounted_esp).context("Failed to create dir {mounted_esp:?}")?;
+
+    Task::new("Mounting ESP", "mount")
+        .args([&PathBuf::from(&esp_device), &mounted_esp.clone()])
+        .run()?;
+
     let is_upgrade = matches!(setup_type, BootSetupType::Upgrade);
 
     println!("Configuring with {:?}", entry);
+    let efi_dir = mounted_esp.join(format!("EFI/Linux"));
     let (bls_config, boot_digest) = match &entry {
         ComposefsBootEntry::Type1(..) => unimplemented!(),
         ComposefsBootEntry::Type2(..) => unimplemented!(),
@@ -1750,7 +1823,13 @@ pub(crate) fn setup_composefs_bls_boot(
                 bls_config.linux = format!("/EFI/Linux/{symlink_to}/vmlinuz");
                 bls_config.initrd = vec![format!("/EFI/Linux/{symlink_to}/initrd")];
             } else {
-                write_bls_boot_entries_to_disk(&boot_dir, id, usr_lib_modules_vmlinuz, &repo)?;
+                // Write vmlinuz/initrd to rootfs boot dir
+                let rootfs_boot_dir = root_path.join("boot");
+                write_vmlinuz_initrd_to_rootfs(&rootfs_boot_dir, id, usr_lib_modules_vmlinuz, &repo)?;
+                // Write BLS entry to ESP
+                let efi_dir_utf8 = Utf8PathBuf::from_path_buf(efi_dir.clone())
+                    .map_err(|_| anyhow::anyhow!("EFI dir is not valid UTF-8"))?;
+                write_bls_entry_to_esp(&efi_dir_utf8, &bls_config)?;
             }
 
             (bls_config, boot_digest)
@@ -1764,10 +1843,12 @@ pub(crate) fn setup_composefs_bls_boot(
         // This will be atomically renamed to 'loader/entries' on shutdown/reboot
         (
             esp_path.join(format!("loader/{STAGED_BOOT_LOADER_ENTRIES}")),
+            efi_dir.join(format!("loader/{STAGED_BOOT_LOADER_ENTRIES}")),
             Some(booted_bls),
         )
     } else {
         (esp_path.join(format!("loader/{BOOT_LOADER_ENTRIES}")), None)
+        (efi_dir.join(format!("loader/{BOOT_LOADER_ENTRIES}")), None)
     };
 
     println!("Creating {:?}", entries_path);
@@ -1789,13 +1870,19 @@ pub(crate) fn setup_composefs_bls_boot(
     )?;
 
     if let Some(booted_bls) = booted_bls {
+    // Scope to allow for proper unmounting
+    {
+        let loader_entries_dir =
+            cap_std::fs::Dir::open_ambient_dir(&entries_path, cap_std::ambient_authority())
+                .with_context(|| format!("Opening {entries_path:?}"))?;
+
         loader_entries_dir.atomic_write(
             // SAFETY: We set sort_key above
             format!(
                 "bootc-composefs-{}.conf",
-                booted_bls.sort_key.as_ref().unwrap()
+                bls_config.sort_key.as_ref().unwrap()
             ),
-            booted_bls.to_string().as_bytes(),
+            bls_config.to_string().as_bytes(),
         )?;
     }
 
@@ -1805,6 +1892,34 @@ pub(crate) fn setup_composefs_bls_boot(
 
     println!("Syncing BLS entries to disk");
     rustix::fs::fsync(owned_loader_entries_fd).context("fsync")?;
+
+        if let Some(booted_bls) = booted_bls {
+            loader_entries_dir.atomic_write(
+                // SAFETY: We set sort_key above
+                format!(
+                    "bootc-composefs-{}.conf",
+                    booted_bls.sort_key.as_ref().unwrap()
+                ),
+                booted_bls.to_string().as_bytes(),
+            )?;
+        }
+
+        let owned_loader_entries_fd = loader_entries_dir
+            .reopen_as_ownedfd()
+            .context("Reopening as owned fd")?;
+        rustix::fs::fsync(owned_loader_entries_fd).context("fsync")?;
+    }
+
+    Task::new("Unmounting ESP", "umount")
+        .arg(&mounted_esp)
+        .run()?;
+
+    if !esp_mount_point_existed {
+        // This shouldn't be a fatal error
+        if let Err(e) = std::fs::remove_dir(&mounted_esp) {
+            tracing::error!("Failed to remove mount point '{mounted_esp:?}': {e}");
+        }
+    }
 
     println!("Wrote BLS entry for deployment {id_hex} to {entries_path}");
     Ok(boot_digest)
